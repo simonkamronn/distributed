@@ -37,6 +37,8 @@ def _futures_to_dask_dataframe(futures, divisions=None, executor=None):
             divisions2 = [None] * (len(futures) + 1)
     elif divisions in (None, False):
         divisions2 = [None] * (len(futures) + 1)
+    elif isinstance(divisions, list):
+        divisions2 = divisions
     else:
         raise NotImplementedError()
     empty = yield empty._result()
