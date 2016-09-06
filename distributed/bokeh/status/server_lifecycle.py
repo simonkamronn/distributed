@@ -13,7 +13,7 @@ from tornado.iostream import StreamClosedError
 from tornado.ioloop import IOLoop
 
 from distributed.compatibility import ConnectionRefusedError
-from distributed.core import read
+from distributed.core import read, connect, write, dumps
 from distributed.diagnostics.progress_stream import progress_stream
 from distributed.bokeh.worker_monitor import resource_append
 import distributed.bokeh
@@ -27,8 +27,10 @@ client = AsyncHTTPClient()
 
 messages = distributed.bokeh.messages  # monkey-patching
 
-if os.path.exists('.dask-web-ui.json'):
-    with open('.dask-web-ui.json', 'r') as f:
+dask_dir = os.path.join(os.path.expanduser('~'), '.dask')
+options_path = os.path.join(dask_dir, '.dask-web-ui.json')
+if os.path.exists(options_path):
+    with open(options_path, 'r') as f:
         options = json.load(f)
 else:
     options = {'host': '127.0.0.1',
@@ -40,11 +42,11 @@ else:
 def http_get(route):
     """ Get data from JSON route, store in messages deques """
     try:
-        response = yield client.fetch(
-                'http://%(host)s:%(http-port)d/' % options
-                 + route + '.json')
-    except ConnectionRefusedError:
-        import sys; sys.exit(0)
+        url = 'http://%(host)s:%(http-port)d/' % options + route + '.json'
+        response = yield client.fetch(url)
+    except ConnectionRefusedError as e:
+        logger.info("Can not connect to %s", url, exc_info=True)
+        return
     except HTTPError:
         logger.warn("http route %s failed", route)
         return
@@ -86,6 +88,23 @@ def progress():
                 messages['progress'] = msg
 
 
+@gen.coroutine
+def processing():
+    with log_errors():
+        from distributed.diagnostics.scheduler import processing
+        stream = yield connect(ip=options['host'], port=options['tcp-port'])
+        yield write(stream, {'op': 'feed',
+                             'function': dumps(processing),
+                             'interval': 0.200})
+        while True:
+            try:
+                msg = yield read(stream)
+            except StreamClosedError:
+                break
+            else:
+                messages['processing'] = msg
+
+
 def on_server_loaded(server_context):
     n = 60
     messages['workers'] = {'interval': 500,
@@ -94,7 +113,7 @@ def on_server_loaded(server_context):
                            'index': deque(maxlen=n),
                            'plot-data': {'time': deque(maxlen=n),
                                          'cpu': deque(maxlen=n),
-                                         'memory-percent': deque(maxlen=n),
+                                         'memory_percent': deque(maxlen=n),
                                          'network-send': deque(maxlen=n),
                                          'network-recv': deque(maxlen=n)}}
     server_context.add_periodic_callback(workers, 500)
@@ -104,7 +123,11 @@ def on_server_loaded(server_context):
                          'times': deque(maxlen=100)}
     server_context.add_periodic_callback(lambda: http_get('tasks'), 100)
 
-    messages['progress'] = {'all': {}, 'in_memory': {},
+    messages['progress'] = {'all': {}, 'memory': {},
                             'erred': {}, 'released': {}}
+
+    messages['processing'] = {'stacks': {}, 'processing': {},
+                              'memory': 0, 'waiting': 0, 'ready': 0}
+    IOLoop.current().add_callback(processing)
 
     IOLoop.current().add_callback(progress)

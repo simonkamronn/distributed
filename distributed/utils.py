@@ -18,6 +18,7 @@ from tornado import gen
 from tornado.iostream import StreamClosedError
 
 from .compatibility import Queue, PY3
+from .config import config
 
 logger = logging.getLogger(__name__)
 
@@ -226,11 +227,11 @@ def ensure_ip(hostname):
     >>> ensure_ip('localhost:5000')
     '127.0.0.1:5000'
     """
+    if PY3 and isinstance(hostname, bytes):
+        hostname = hostname.decode()
     if ':' in hostname:
         host, port = hostname.rsplit(':', 1)
         return ':'.join([ensure_ip(host), port])
-    if PY3 and isinstance(hostname, bytes):
-        hostname = hostname.decode()
     if re.match('\d+\.\d+\.\d+\.\d+', hostname):  # is IP
         return hostname
     else:
@@ -319,7 +320,7 @@ def _maybe_complex(task):
             type(task) is dict and any(map(_maybe_complex, task.values())))
 
 
-def str_graph(dsk):
+def str_graph(dsk, extra_values=()):
     def convert(task):
         if type(task) is list:
             return [convert(v) for v in task]
@@ -328,7 +329,7 @@ def str_graph(dsk):
         if istask(task):
             return (task[0],) + tuple(map(convert, task[1:]))
         try:
-            if task in dsk:
+            if task in dsk or task in extra_values:
                 return tokey(task)
         except TypeError:
             pass
@@ -338,8 +339,13 @@ def str_graph(dsk):
 
 
 import logging
+from .compatibility import logging_names
 logging.basicConfig(format='%(name)s - %(levelname)s - %(message)s',
                     level=logging.INFO)
+
+for name, level in config.get('logging', {}).items():
+    LEVEL = logging_names[level.upper()]
+    logging.getLogger(name).setLevel(LEVEL)
 
 # http://stackoverflow.com/questions/21234772/python-tornado-disable-logging-to-stderr
 stream = logging.StreamHandler(sys.stderr)

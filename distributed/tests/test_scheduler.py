@@ -3,12 +3,12 @@ from __future__ import print_function, division, absolute_import
 import cloudpickle
 from collections import defaultdict, deque
 from copy import deepcopy
-from datetime import datetime
 from operator import add
 import sys
 from time import time, sleep
 
 import dask
+from dask import delayed
 from dask.core import get_deps
 from toolz import merge, concat, valmap, first
 from tornado.queues import Queue
@@ -24,6 +24,7 @@ from distributed.core import connect, read, write, rpc, dumps
 from distributed.client import WrappedKey
 from distributed.scheduler import (validate_state, decide_worker,
         Scheduler)
+from distributed.executor import _wait
 from distributed.worker import dumps_function, dumps_task
 from distributed.utils_test import (inc, ignoring, dec, gen_cluster, gen_test,
         loop)
@@ -33,6 +34,15 @@ from dask.compatibility import apply
 
 alice = 'alice:1234'
 bob = 'bob:1234'
+
+
+@gen_cluster()
+def test_administration(s, a, b):
+    assert isinstance(s.address, str)
+    assert s.address_tuple[0] in s.address
+    assert s.address in str(s)
+    assert str(sum(s.ncores.values())) in repr(s)
+    assert str(len(s.ncores)) in repr(s)
 
 
 @gen_cluster()
@@ -46,18 +56,19 @@ def test_ready_add_worker(s, a, b):
                    dependencies={'x-%d' % i: set() for i in range(20)})
 
 
-def test_update_state(loop):
-    s = Scheduler()
-    s.start(0)
+@gen_cluster(ncores=[])
+def test_update_state(s):
     s.add_worker(address=alice, ncores=1, coerce_address=False)
     s.update_graph(tasks={'x': 1, 'y': (inc, 'x')},
                    keys=['y'],
                    dependencies={'y': 'x', 'x': set()},
                    client='client')
 
-    s.mark_task_finished('x', alice, nbytes=10, type=dumps(int),
-            compute_start=10, compute_stop=11)
-    s.ensure_occupied(alice)
+    s.ensure_occupied()
+    r = s.transition('x', 'memory', nbytes=10, type=dumps(int),
+            compute_start=10, compute_stop=11, worker=alice)
+    s.transitions(r)
+    s.ensure_occupied()
 
     assert set(s.processing[alice]) == {'y'}
     assert set(s.rprocessing['y']) == {alice}
@@ -83,21 +94,20 @@ def test_update_state(loop):
 
     assert 'a' in s.ready or 'a' in s.processing[alice]
 
-    s.stop()
 
-
-def test_update_state_with_processing(loop):
-    s = Scheduler()
-    s.start(0)
+@gen_cluster(ncores=[])
+def test_update_state_with_processing(s):
     s.add_worker(address=alice, ncores=1, coerce_address=False)
     s.update_graph(tasks={'x': 1, 'y': (inc, 'x'), 'z': (inc, 'y')},
                    keys=['z'],
                    dependencies={'y': {'x'}, 'x': set(), 'z': {'y'}},
                    client='client')
 
-    s.mark_task_finished('x', alice, nbytes=10, type=dumps(int),
-            compute_start=10, compute_stop=11)
-    s.ensure_occupied(alice)
+    s.ensure_occupied()
+    r = s.transition('x', 'memory', nbytes=10, type=dumps(int),
+            compute_start=10, compute_stop=11, worker=alice)
+    s.transitions(r)
+    s.ensure_occupied()
 
     assert s.waiting == {'z': {'y'}}
     assert s.waiting_data == {'x': {'y'}, 'y': {'z'}, 'z': set()}
@@ -122,62 +132,45 @@ def test_update_state_with_processing(loop):
     assert s.who_wants == {'b': {'client'}, 'c': {'client'}, 'z': {'client'}}
     assert s.wants_what == {'client': {'b', 'c', 'z'}}
 
-    s.stop()
+
+@gen_cluster(executor=True, ncores=[('127.0.0.1', 1)])
+def test_update_state_respects_data_in_memory(e, s, a):
+    x = delayed(inc)(1)
+    y = delayed(inc)(x)
+    f = e.persist(y)
+    yield _wait([f])
+
+    assert s.released == {x.key}
+    assert s.who_has == {y.key: {a.address}}
+
+    z = delayed(add)(x, y)
+    f2 = e.persist(z)
+    while not f2.key in s.who_has:
+        assert y.key in s.who_has
+        yield gen.sleep(0.0001)
 
 
-def test_update_state_respects_data_in_memory(loop):
-    s = Scheduler()
-    s.start(0)
-    s.add_worker(address=alice, ncores=1, coerce_address=False)
-    s.update_graph(tasks={'x': 1, 'y': (inc, 'x')},
-                   keys=['y'],
-                   dependencies={'y': {'x'}, 'x': set()},
-                   client='client')
-
-    s.mark_task_finished('x', alice, nbytes=10, type=dumps(int),
-                         compute_start=10, compute_stop=11)
-    s.ensure_occupied(alice)
-    s.mark_task_finished('y', alice, nbytes=10, type=dumps(int),
-                         compute_start=11, compute_stop=12)
-    s.ensure_occupied(alice)
-
-    assert s.released == {'x'}
-    assert s.who_has == {'y': {alice}}
-
-    s.update_graph(tasks={'x': 1, 'y': (inc, 'x'), 'z': (add, 'y', 'x')},
-                   keys=['z'],
-                   dependencies={'y': {'x'}, 'z': {'y', 'x'}},
-                   client='client')
-
-    assert s.released == set()
-    assert s.waiting == {'z': {'x'}}
-    assert set(s.processing[alice]) == {'x'}  # x was released need to recompute
-    assert set(s.rprocessing['x']) == {alice}  # x was released need to recompute
-    assert s.waiting_data == {'x': {'z'}, 'y': {'z'}, 'z': set()}
-    assert s.who_wants == {'y': {'client'}, 'z': {'client'}}
-    assert s.wants_what == {'client': {'y', 'z'}}
-
-    s.stop()
-
-
-def test_update_state_supports_recomputing_released_results(loop):
-    s = Scheduler()
-    s.start(0)
+@gen_cluster(ncores=[])
+def test_update_state_supports_recomputing_released_results(s):
     s.add_worker(address=alice, ncores=1, coerce_address=False)
     s.update_graph(tasks={'x': 1, 'y': (inc, 'x'), 'z': (inc, 'x')},
                    keys=['z'],
                    dependencies={'y': {'x'}, 'x': set(), 'z': {'y'}},
                    client='client')
 
-    s.mark_task_finished('x', alice, nbytes=10, type=dumps(int),
-                         compute_start=10, compute_stop=11)
-    s.ensure_occupied(alice)
-    s.mark_task_finished('y', alice, nbytes=10, type=dumps(int),
-                         compute_start=10, compute_stop=11)
-    s.ensure_occupied(alice)
-    s.mark_task_finished('z', alice, nbytes=10, type=dumps(int),
-                         compute_start=10, compute_stop=11)
-    s.ensure_occupied(alice)
+    s.ensure_occupied()
+    r = s.transition('x', 'memory', nbytes=10, type=dumps(int),
+            compute_start=10, compute_stop=11, worker=alice)
+    s.transitions(r)
+    s.ensure_occupied()
+    r = s.transition('y', 'memory', nbytes=10, type=dumps(int),
+            compute_start=10, compute_stop=11, worker=alice)
+    s.transitions(r)
+    s.ensure_occupied()
+    r = s.transition('z', 'memory', nbytes=10, type=dumps(int),
+            compute_start=10, compute_stop=11, worker=alice)
+    s.transitions(r)
+    s.ensure_occupied()
 
     assert not s.waiting
     assert not s.ready
@@ -187,7 +180,7 @@ def test_update_state_supports_recomputing_released_results(loop):
 
     s.update_graph(tasks={'x': 1, 'y': (inc, 'x')},
                    keys=['y'],
-                   dependencies={'y': {'x'}},
+                   dependencies={'y': {'x'}, 'x': set()},
                    client='client')
 
     assert s.waiting == {'y': {'x'}}
@@ -195,8 +188,6 @@ def test_update_state_supports_recomputing_released_results(loop):
     assert s.who_wants == {'z': {'client'}, 'y': {'client'}}
     assert s.wants_what == {'client': {'y', 'z'}}
     assert set(s.processing[alice]) == {'x'}
-
-    s.stop()
 
 
 def test_decide_worker_with_many_independent_leaves():
@@ -294,6 +285,7 @@ def test_validate_state():
     in_play = {'x', 'y'}
     who_wants = {'y': {'client'}}
     wants_what = {'client': {'y'}}
+    erred = {}
 
     validate_state(**locals())
 
@@ -389,7 +381,7 @@ def test_scheduler(s, a, b):
 
     # Test missing data
     yield write(stream, {'op': 'missing-data', 'keys': ['z']})
-    s.ensure_idle_ready()
+    s.ensure_occupied()
 
     while True:
         msg = yield read(stream)
@@ -517,7 +509,7 @@ def test_remove_worker_from_scheduler(s, a, b):
     assert a.address not in s.ncores
     assert len(s.ready) + len(s.processing[b.address]) == \
             len(dsk)  # b owns everything
-    s.validate()
+    s.validate_state()
 
 
 @gen_cluster()
@@ -534,7 +526,7 @@ def test_add_worker(s, a, b):
     s.add_worker(address=w.address, keys=list(w.data),
                  ncores=w.ncores, services=s.services, coerce_address=False)
 
-    s.validate()
+    s.validate_state()
 
     assert w.ip in s.host_info
     assert s.host_info[w.ip]['ports'] == set(map(str, [a.port, b.port, w.port]))
@@ -590,7 +582,7 @@ def test_feed_setup_teardown(s, a, b):
 
 @gen_test(timeout=None)
 def test_scheduler_as_center():
-    s = Scheduler()
+    s = Scheduler(validate=True)
     done = s.start(0)
     a = Worker('127.0.0.1', s.port, ip='127.0.0.1', ncores=1)
     a.data.update({'x': 1, 'y': 2})
@@ -606,7 +598,7 @@ def test_scheduler_as_center():
                    keys=['a'],
                    dependencies={'a': []})
     start = time()
-    while not s.who_has['a']:
+    while not 'a' in s.who_has:
         assert time() - start < 5
         yield gen.sleep(0.01)
     assert 'a' in a.data or 'a' in b.data or 'a' in c.data
@@ -620,37 +612,34 @@ def test_scheduler_as_center():
     yield s.close()
 
 
-@gen_cluster()
-def test_delete_data(s, a, b):
-    yield s.scatter(data=valmap(dumps, {'x': 1, 'y': 2, 'z': 3}),
-                    client='client')
+@gen_cluster(executor=True)
+def test_delete_data(e, s, a, b):
+    d = yield e._scatter({'x': 1, 'y': 2, 'z': 3})
+
     assert set(s.who_has) == {'x', 'y', 'z'}
     assert set(a.data) | set(b.data) == {'x', 'y', 'z'}
     assert merge(a.data, b.data) == {'x': 1, 'y': 2, 'z': 3}
 
-    s.delete_data(keys=['x', 'y'])
-    yield s.clear_data_from_workers()
-    assert set(a.data) | set(b.data) == {'z'}
+    del d['x']
+    del d['y']
+
+    start = time()
+    while set(a.data) | set(b.data) != {'z'}:
+        yield gen.sleep(0.01)
+        assert time() < start + 5
 
 
-@gen_cluster()
-def test_rpc(s, a, b):
-    aa = s.rpc(ip=a.ip, port=a.port)
-    aa2 = s.rpc(ip=a.ip, port=a.port)
-    bb = s.rpc(ip=b.ip, port=b.port)
-    assert aa is aa2
-    assert aa is not bb
+@gen_cluster(executor=True)
+def test_delete_callback(e, s, a, b):
+    d = yield e._scatter({'x': 1}, workers=a.address)
 
+    assert s.who_has['x'] == {a.address}
+    assert s.has_what[a.address] == {'x'}
 
-@gen_cluster()
-def test_delete_callback(s, a, b):
-    a.data['x'] = 1
-    s.who_has['x'].add(a.address)
-    s.has_what[a.address].add('x')
+    s.client_releases_keys(client=e.id, keys=['x'])
 
-    s.delete_data(keys=['x'])
-    assert not s.who_has['x']
-    assert not s.has_what['y']
+    assert 'x' not in s.who_has
+    assert 'x' not in s.has_what[a.address]
     assert a.data['x'] == 1  # still in memory
     assert s.deleted_keys == {a.address: {'x'}}
     yield s.clear_data_from_workers()
@@ -813,17 +802,20 @@ def test_ready_add_worker(s, a, b):
 
 
 @gen_cluster()
-def test_ready_add_worker(s, a, b):
+def test_broadcast(s, a, b):
     result = yield s.broadcast(msg={'op': 'ping'})
     assert result == {a.address: b'pong', b.address: b'pong'}
 
     result = yield s.broadcast(msg={'op': 'ping'}, workers=[a.address])
     assert result == {a.address: b'pong'}
 
+    result = yield s.broadcast(msg={'op': 'ping'}, hosts=[a.ip])
+    assert result == {a.address: b'pong', b.address: b'pong'}
+
 
 @gen_test()
 def test_worker_name():
-    s = Scheduler()
+    s = Scheduler(validate=True)
     s.start(0)
     w = Worker(s.ip, s.port, name='alice')
     yield w._start()
@@ -840,7 +832,7 @@ def test_worker_name():
 
 @gen_test()
 def test_coerce_address():
-    s = Scheduler()
+    s = Scheduler(validate=True)
     s.start(0)
     a = Worker(s.ip, s.port, name='alice')
     b = Worker(s.ip, s.port, name=123)
@@ -865,29 +857,24 @@ def test_coerce_address():
     yield [w._close() for w in [a, b, c]]
 
 
-@pytest.mark.skipif(sys.platform.startswith('windows'),
+@pytest.mark.skipif(sys.platform.startswith('win'),
                     reason="file descriptors not really a thing")
-def test_file_descriptors_dont_leak(loop):
+@gen_cluster(ncores=[])
+def test_file_descriptors_dont_leak(s):
     psutil = pytest.importorskip('psutil')
     proc = psutil.Process()
     before = proc.num_fds()
-    s = Scheduler()
-    s.start(0)
 
     w = Worker(s.ip, s.port)
-    @gen.coroutine
-    def f():
-        yield w._start(0)
-        yield w._close()
-    loop.run_sync(f)
+
+    yield w._start(0)
+    yield w._close()
 
     during = proc.num_fds()
-    s.stop()
-    s.close()
 
     start = time()
     while proc.num_fds() > before:
-        loop.run_sync(lambda: gen.sleep(0.01))
+        yield gen.sleep(0.01)
         assert time() < start + 5
 
 
@@ -907,20 +894,15 @@ def test_update_graph_culls(s, a, b):
 @gen_cluster(ncores=[('127.0.0.1', 2), ('127.0.0.2', 2), ('127.0.0.1', 1)])
 def test_host_health(s, a, b, c):
     start = time()
-    while any('last-seen' not in v for v in s.host_info.values()):
-        yield gen.sleep(0.1)
-        assert time() < start + 5
 
     for w in [a, b, c]:
         assert w.ip in s.host_info
-        assert 0 < s.host_info[w.ip]['latency'] < 1
         assert 0 <= s.host_info[w.ip]['cpu'] <= 100
         assert 0 < s.host_info[w.ip]['memory']
-        assert 0 < s.host_info[w.ip]['memory-percent'] < 100
+        assert 0 < s.host_info[w.ip]['memory_percent'] < 100
 
-        assert isinstance(s.host_info[w.ip]['last-seen'], datetime)
-        assert s.host_info[w.ip]['heartbeat-port'] in s.host_info[w.ip]['ports']
-        assert -1 < s.host_info[w.ip]['time-delay'] < 1
+        assert isinstance(s.host_info[w.ip]['last-seen'], (int, float))
+        assert -1 < s.worker_info[w.address]['time-delay'] < 1
 
     assert set(s.host_info) == {'127.0.0.1', '127.0.0.2'}
     assert s.host_info['127.0.0.1']['cores'] == 3
@@ -933,18 +915,59 @@ def test_host_health(s, a, b, c):
     assert set(s.host_info) == {'127.0.0.1', '127.0.0.2'}
     assert s.host_info['127.0.0.1']['cores'] == 1
     assert s.host_info['127.0.0.1']['ports'] == {str(c.port)}
-    assert s.host_info[c.ip]['heartbeat-port'] == str(c.port)
     assert s.host_info['127.0.0.2']['cores'] == 2
     assert s.host_info['127.0.0.2']['ports'] == {str(b.port)}
-    assert s.host_info[b.ip]['heartbeat-port'] == str(b.port)
 
     s.remove_worker(address=b.address)
 
     assert set(s.host_info) == {'127.0.0.1'}
     assert s.host_info['127.0.0.1']['cores'] == 1
     assert s.host_info['127.0.0.1']['ports'] == {str(c.port)}
-    assert s.host_info[c.ip]['heartbeat-port'] == str(c.port)
 
     s.remove_worker(address=c.address)
 
     assert not s.host_info
+
+
+@gen_cluster(ncores=[])
+def test_add_worker_is_idempotent(s):
+    s.add_worker(address=alice, ncores=1, coerce_address=False)
+    ncores = s.ncores.copy()
+    s.add_worker(address=alice, coerce_address=False)
+    assert s.ncores == s.ncores
+
+
+def test_io_loop(loop):
+    s = Scheduler(loop=loop, validate=True)
+    assert s.io_loop is loop
+
+
+@gen_cluster(executor=True)
+def test_transition_story(e, s, a, b):
+    x = delayed(inc)(1)
+    y = delayed(inc)(x)
+    f = e.persist(y)
+    yield _wait([f])
+
+    assert s.transition_log
+
+    story = s.transition_story(x.key)
+    assert all(line in s.transition_log for line in story)
+    assert len(story) < len(s.transition_log)
+    assert all(x.key == line[0] or x.key in line[-1] for line in story)
+
+    assert len(s.transition_story(x.key, y.key)) > len(story)
+
+
+@gen_test()
+def test_launch_without_blocked_services():
+    from distributed.http import HTTPScheduler
+    s = Scheduler(services={('http', 3849): HTTPScheduler})
+    s.start(0)
+
+    s2 = Scheduler(services={('http', 3849): HTTPScheduler})
+    s2.start(0)
+
+    assert not s2.services
+
+    yield [s.close(), s2.close()]

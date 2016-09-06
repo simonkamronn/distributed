@@ -11,6 +11,7 @@ from tornado import gen
 
 from .core import Server, rpc, write
 from .utils import get_ip, ignoring, log_errors
+from .worker import _ncores
 
 
 logger = logging.getLogger(__name__)
@@ -21,28 +22,29 @@ class Nanny(Server):
     The nanny spins up Worker processes, watches then, and kills or restarts
     them as necessary.
     """
-    def __init__(self, center_ip, center_port, ip=None, worker_port=0,
-                ncores=None, loop=None, local_dir=None, services=None,
-                name=None, **kwargs):
+    def __init__(self, scheduler_ip, scheduler_port, ip=None, worker_port=0,
+                 ncores=None, loop=None, local_dir=None, services=None,
+                 name=None, memory_limit=None, **kwargs):
         self.ip = ip or get_ip()
         self.worker_port = None
         self._given_worker_port = worker_port
-        self.ncores = ncores
+        self.ncores = ncores or _ncores
         self.local_dir = local_dir
         self.worker_dir = ''
         self.status = None
         self.process = None
         self.loop = loop or IOLoop.current()
-        self.center = rpc(ip=center_ip, port=center_port)
+        self.scheduler = rpc(ip=scheduler_ip, port=scheduler_port)
         self.services = services
         self.name = name
+        self.memory_limit = memory_limit
 
         handlers = {'instantiate': self.instantiate,
                     'kill': self._kill,
                     'terminate': self._close,
                     'monitor_resources': self.monitor_resources}
 
-        super(Nanny, self).__init__(handlers, **kwargs)
+        super(Nanny, self).__init__(handlers, io_loop=self.loop, **kwargs)
 
     @gen.coroutine
     def _start(self, port=0):
@@ -61,7 +63,7 @@ class Nanny(Server):
     def _kill(self, stream=None, timeout=5):
         """ Kill the local worker process
 
-        Blocks until both the process is down and the center is properly
+        Blocks until both the process is down and the scheduler is properly
         informed
         """
         while not self.worker_port:
@@ -69,41 +71,60 @@ class Nanny(Server):
 
         if self.process is not None:
             try:
+                # Ask worker to close
+                worker = rpc(ip='127.0.0.1', port=self.worker_port)
+                result = yield gen.with_timeout(
+                            timedelta(seconds=min(1, timeout)),
+                            worker.terminate(report=False),
+                            io_loop=self.loop)
+            except gen.TimeoutError:
+                logger.info("Worker non-responsive.  Terminating.")
+            except Exception as e:
+                logger.exception(e)
+
+            try:
+                # Tell scheduler that worker is gone
                 result = yield gen.with_timeout(timedelta(seconds=timeout),
-                            self.center.unregister(address=self.worker_address))
+                            self.scheduler.unregister(address=self.worker_address),
+                            io_loop=self.loop)
                 if result not in ('OK', 'already-removed'):
-                    logger.critical("Unable to unregister with center %s. "
+                    logger.critical("Unable to unregister with scheduler %s. "
                             "Nanny: %s, Worker: %s", result, self.address_tuple,
                             self.worker_address)
                 else:
-                    logger.info("Unregister worker %s:%d from center",
+                    logger.info("Unregister worker %s:%d from scheduler",
                                 self.ip, self.worker_port)
             except gen.TimeoutError:
                 logger.info("Nanny %s:%d failed to unregister worker %s:%d",
                         self.ip, self.port, self.ip, self.worker_port,
                         exc_info=True)
-            self.process.terminate()
-            self.process.join(timeout=timeout)
-            self.process = None
-            self.cleanup()
-            logger.info("Nanny %s:%d kills worker process %s:%d",
-                        self.ip, self.port, self.ip, self.worker_port)
+            except Exception as e:
+                logger.exception(e)
+
+            if self.process:
+                self.process.terminate()
+                self.process.join(timeout=timeout)
+                self.process = None
+                self.cleanup()
+                logger.info("Nanny %s:%d kills worker process %s:%d",
+                            self.ip, self.port, self.ip, self.worker_port)
         raise gen.Return('OK')
 
     @gen.coroutine
     def instantiate(self, stream=None):
         """ Start a local worker process
 
-        Blocks until the process is up and the center is properly informed
+        Blocks until the process is up and the scheduler is properly informed
         """
         if self.process and self.process.is_alive():
             raise ValueError("Existing process still alive. Please kill first")
         q = Queue()
         self.process = Process(target=run_worker,
-                               args=(q, self.ip, self.center.ip,
-                                     self.center.port, self.ncores,
+                               args=(q, self.ip, self.scheduler.ip,
+                                     self.scheduler.port, self.ncores,
                                      self.port, self._given_worker_port,
-                                     self.local_dir, self.services, self.name))
+                                     self.local_dir, self.services, self.name,
+                                     self.memory_limit))
         self.process.daemon = True
         self.process.start()
         while True:
@@ -112,8 +133,8 @@ class Nanny(Server):
                 if isinstance(msg, Exception):
                     raise msg
                 self.worker_port = msg['port']
-                assert self.worker_port
                 self.worker_dir = msg['dir']
+                assert self.worker_port
                 break
             except queues.Empty:
                 yield gen.sleep(0.1)
@@ -131,13 +152,13 @@ class Nanny(Server):
     def _watch(self, wait_seconds=0.10):
         """ Watch the local process, if it dies then spin up a new one """
         while True:
-            if self.status == 'closed':
+            if closing[0] or self.status == 'closed':
                 yield self._close()
                 break
-            if self.process and not self.process.is_alive():
-                logger.warn("Discovered failed worker.  Restarting")
+            elif self.process and not self.process.is_alive():
+                logger.warn("Discovered failed worker.  Restarting.  Status: %s", self.status)
                 self.cleanup()
-                yield self.center.unregister(address=self.worker_address)
+                yield self.scheduler.unregister(address=self.worker_address)
                 yield self.instantiate()
             else:
                 yield gen.sleep(wait_seconds)
@@ -146,10 +167,10 @@ class Nanny(Server):
     def _close(self, stream=None, timeout=5, report=None):
         """ Close the nanny process, stop listening """
         logger.info("Closing Nanny at %s:%d", self.ip, self.port)
-        yield self._kill(timeout=timeout)
-        self.center.close_streams()
-        self.stop()
         self.status = 'closed'
+        yield self._kill(timeout=timeout)
+        self.scheduler.close_streams()
+        self.stop()
         raise gen.Return('OK')
 
     @property
@@ -190,17 +211,18 @@ class Nanny(Server):
             yield gen.sleep(interval)
 
 
-def run_worker(q, ip, center_ip, center_port, ncores, nanny_port,
-        worker_port, local_dir, services, name):
+def run_worker(q, ip, scheduler_ip, scheduler_port, ncores, nanny_port,
+        worker_port, local_dir, services, name, memory_limit):
     """ Function run by the Nanny when creating the worker """
     from distributed import Worker  # pragma: no cover
     from tornado.ioloop import IOLoop  # pragma: no cover
     IOLoop.clear_instance()  # pragma: no cover
     loop = IOLoop()  # pragma: no cover
     loop.make_current()  # pragma: no cover
-    worker = Worker(center_ip, center_port, ncores=ncores, ip=ip,
+    worker = Worker(scheduler_ip, scheduler_port, ncores=ncores, ip=ip,
                     service_ports={'nanny': nanny_port}, local_dir=local_dir,
-                    services=services, name=name)  # pragma: no cover
+                    services=services, name=name, memory_limit=memory_limit,
+                    loop=loop)  # pragma: no cover
 
     @gen.coroutine  # pragma: no cover
     def start():
@@ -214,5 +236,18 @@ def run_worker(q, ip, center_ip, center_port, ncores, nanny_port,
             q.put({'port': worker.port, 'dir': worker.local_dir})  # pragma: no cover
 
     loop.add_callback(start)  # pragma: no cover
-    with ignoring(KeyboardInterrupt):
+    try:
         loop.start()  # pragma: no cover
+    finally:
+        loop.stop()
+        loop.close(all_fds=True)
+
+
+import atexit
+
+closing = [False]
+
+def _closing():
+    closing[0] = True
+
+atexit.register(_closing)

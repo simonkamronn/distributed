@@ -1,5 +1,6 @@
 from __future__ import print_function, division, absolute_import
 
+import logging
 import sys
 
 if sys.version_info[0] == 2:
@@ -33,6 +34,7 @@ if sys.version_info[0] == 2:
                 hasattr(o, '__module__') and
                 o.__module__ == 'Queue')
 
+    logging_names = logging._levelNames
 
 if sys.version_info[0] == 3:
     from queue import Queue, Empty
@@ -47,6 +49,12 @@ if sys.version_info[0] == 3:
 
     def isqueue(o):
         return isinstance(o, Queue)
+
+    logging_names = logging._levelToName.copy()
+    logging_names.update(logging._nameToLevel)
+
+
+WINDOWS = sys.platform.startswith('win')
 
 
 try:

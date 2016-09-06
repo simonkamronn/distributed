@@ -28,8 +28,9 @@ class SchedulerPlugin(object):
     ...     def __init__(self):
     ...         self.counter = 0
     ...
-    ...     def task_finished(self, scheduler, key, worker, nbytes):
-    ...         self.counter += 1
+    ...     def transition(self, key, start, finish, *args, **kwargs):
+    ...         if start == 'processing' and finish == 'memory':
+    ...             self.counter += 1
     ...
     ...     def restart(self, scheduler):
     ...         self.counter = 0
@@ -37,33 +38,15 @@ class SchedulerPlugin(object):
     >>> c = Counter()
     >>> scheduler.add_plugin(c)  # doctest: +SKIP
     """
-    def task_finished(self, scheduler, key=None, worker=None, nbytes=None,
-            **kwargs):
-        """ Run when a task is reported complete """
-        pass
 
     def update_graph(self, scheduler, dsk=None, keys=None,
             restrictions=None, **kwargs):
         """ Run when a new graph / tasks enter the scheduler """
         pass
 
-    def task_erred(self, scheduler, key=None, worker=None, exception=None,
-            **kwargs):
-        """ Run when a task is reported failed """
-        pass
-
     def restart(self, scheduler, **kwargs):
         """ Run when the scheduler restarts itself """
         pass
 
-    def forget(self, scheduler, key):
-        pass
-
-    def delete(self, scheduler, key):
-        pass
-
-    def mark_key_in_memory(self, scheduler, key, **kwargs):
-        pass
-
-    def lost_data(self, scheduler, key):
+    def transition(self, key, start, finish, *args, **kwargs):
         pass
